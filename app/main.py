@@ -3,7 +3,8 @@ from . import schemas,database,llm,models
 from sqlalchemy.orm import Session
 import time
 from . embeddings import lifespan, generate_embedding
-
+import hashlib
+import json
 # Register the lifespan from embeddings.py
 app = FastAPI(title="LLM Semantic Cache Proxy", lifespan=lifespan)
 models.base.metadata.create_all(bind=database.engine)
@@ -14,14 +15,16 @@ def save_log_and_cache(
     response_text: str,
     vector: list,
     latency: float,
+    params_hash: str
 ):
     # Instantiate a fresh, independent DB session for the background task
     db = database.SessionLocal()
+    
     try:
         cache_data = models.cache_entries(
             tenant_id="default",
             model=model_name,
-            params_hash="default",
+            params_hash=params_hash,
             prompt=prompt,
             response=response_text,
             embedding=vector,
@@ -50,6 +53,14 @@ async def generate_response(
     user_model = request.model
     first_message = request.messages[0].content
 
+    llm_params = {
+        "temperature": getattr(request, "temperature", 0.7),
+        "max_tokens": getattr(request, "max_tokens", 1024),
+        "model": request.model
+    }
+    params_string = json.dumps(llm_params, sort_keys=True)
+    real_params_hash = hashlib.md5(params_string.encode('utf-8')).hexdigest(
+    )
     # 1. Generate response from LLM
     response_data = await llm.generate(request)
 
@@ -68,6 +79,8 @@ async def generate_response(
         response_text=assistant_reply,
         vector=vector,
         latency=latency_ms,
+        params_hash=real_params_hash
+        
     )
 
     # 4. Return response immediately to client
