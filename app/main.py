@@ -8,35 +8,67 @@ from . embeddings import lifespan, generate_embedding
 app = FastAPI(title="LLM Semantic Cache Proxy", lifespan=lifespan)
 models.base.metadata.create_all(bind=database.engine)
 
-@app.post("/test-embed")
-async def test_embed(prompt: str):
-    # Call your asynchronous helper
-    vector = await generate_embedding(prompt)
-    return {
-        "prompt": prompt,
-        "vector_dimensions": len(vector),
-        "sample_values": vector[:5]  # First 5 numbers of the 384 array
-    }
+def save_log_and_cache(
+    prompt: str,
+    model_name: str,
+    response_text: str,
+    vector: list,
+    latency: float,
+):
+    # Instantiate a fresh, independent DB session for the background task
+    db = database.SessionLocal()
+    try:
+        cache_data = models.cache_entries(
+            tenant_id="default",
+            model=model_name,
+            params_hash="default",
+            prompt=prompt,
+            response=response_text,
+            embedding=vector,
+        )
+        db.add(cache_data)
+
+        new_log = models.request_log(prompt=prompt, latency=latency)
+        db.add(new_log)
+
+        db.commit()
+        print("Background save complete!")
+    except Exception as e:
+        db.rollback()
+        print(f"Error in background task: {e}")
+    finally:
+        db.close()  # Clean up the connection when finished
 
 
 @app.post("/v1/chat/completions")
-async def generate_response(request:schemas.completionMessage,background_tasks: BackgroundTasks,db:Session=Depends(database.get_db)):
-    start_time=time.perf_counter()
+async def generate_response(
+    request: schemas.completionMessage,
+    background_tasks: BackgroundTasks,
+):
+    start_time = time.perf_counter()
 
+    user_model = request.model
+    first_message = request.messages[0].content
 
-    user_model=request.model
-    first_message=request.messages[0].content
-    response_data=await llm.generate(request)
+    # 1. Generate response from LLM
+    response_data = await llm.generate(request)
 
-    end_time=time.perf_counter()
-    latency_ms=(end_time-start_time)*1000
-    def save_log():
+    end_time = time.perf_counter()
+    latency_ms = (end_time - start_time) * 1000
 
-        new_log=models.request_log(prompt=first_message,latency=latency_ms)
-        db.add(new_log)
-        db.commit()
+    # 2. Extract values and generate vector
+    vector = await generate_embedding(first_message)
+    assistant_reply = response_data["choices"][0]["message"]["content"]
 
-    background_tasks.add_task(save_log)    
+    # 3. Offload saving to background task
+    background_tasks.add_task(
+        save_log_and_cache,
+        prompt=first_message,
+        model_name=user_model,
+        response_text=assistant_reply,
+        vector=vector,
+        latency=latency_ms,
+    )
 
+    # 4. Return response immediately to client
     return response_data
-    
